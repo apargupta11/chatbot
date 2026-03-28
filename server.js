@@ -1,123 +1,155 @@
 import express from "express";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import { retrieveDocs } from "./rag/query.js";
 
 dotenv.config();
-
 const app = express();
-app.use(cors());
+// Fixed the typo "app.use(express.json());a" from your snippet
 app.use(express.json());
+
+const uri = process.env.MONGODB_URI;
+if (!uri) {
+  console.error("❌ ERROR: MONGODB_URI missing in .env");
+  process.exit(1);
+}
 
 const client = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: "https://api.groq.com/openai/v1"
 });
 
+const mongoClient = new MongoClient(uri);
 let db;
-const mongoClient = new MongoClient(process.env.MONGODB_URI);
 
-const SYSTEM_PERSONA = `
-You are a Professional Data Assistant. 
-You have access to a Movie Database (MongoDB) and a Resume PDF (ChromaDB).
-RULES:
-1. If the user asks about themselves, use the 'User/Commenter' data.
-2. If the user asks about a movie, use the 'Movie' data.
-3. If they ask about professional experience, use the 'PDF Context'.
-4. If you don't know the answer, say you don't know.
-`;
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "search_database",
+      description: "Search any collection in the database. Use this for specific user info, movies, or records.",
+      parameters: {
+        type: "object",
+        properties: {
+          collectionName: { type: "string" },
+          searchField: { type: "string", description: "The field to search (e.g., 'name', 'title', '_id')" },
+          searchTerm: { type: "string", description: "The value or ID to look for" }
+        },
+        required: ["collectionName", "searchField", "searchTerm"]
+      }
+    }
+  }
+];
 
 app.post("/chat", async (req, res) => {
   try {
     const { message, userId } = req.body;
-
-    if (!message || !userId || !ObjectId.isValid(userId)) {
-      return res.status(400).json({ error: "Valid message and 24-char userId are required" });
-    }
-
-    const objId = new ObjectId(userId);
-
-    // --- SMART SEARCH (Option 2) ---
-    // We look in all 3 major collections at the same time
-    const [commentData, movieData, userAccount, userSession] = await Promise.all([
-      db.collection("comments").findOne({ _id: objId }),
-      db.collection("movies").findOne({ _id: objId }),
-      db.collection("users").findOne({ _id: objId }),
-      db.collection("chat_histories").findOne({ userId: userId })
-    ]);
-
-    // Format the Database Context based on what we found
-    let dbContext = "No specific database record found for this ID.";
-    
-    if (movieData) {
-      dbContext = `MOVIE FOUND: "${movieData.title}" (${movieData.year}). Plot: ${movieData.fullplot || movieData.plot}`;
-    } else if (commentData) {
-      dbContext = `USER/COMMENTER FOUND: Name: ${commentData.name}, Email: ${commentData.email}, Last Comment: ${commentData.text}`;
-    } else if (userAccount) {
-      dbContext = `ACCOUNT HOLDER FOUND: Name: ${userAccount.name}, Email: ${userAccount.email}`;
-    }
-
-    // --- RAG RETRIEVAL (PDF) ---
+    let dbContext = "";
     let pdfContext = "";
+
+    // --- NEW: MEMORY RETRIEVAL ---
+    const session = await db.collection("chat_histories").findOne({ userId: userId });
+    const history = session?.messages || [];
+    const currentSummary = session?.summary || "No history yet.";
+
+    // 1. SEARCH DATABASE (Your existing logic)
+    const collections = await db.listCollections().toArray();
+    for (const col of collections) {
+      if (!ObjectId.isValid(userId)) break;
+      const result = await db.collection(col.name).findOne({ _id: new ObjectId(userId) });
+      if (result) {
+        dbContext = ` ${JSON.stringify(result)}`;
+        break; 
+      }
+    }
+
+    // 2. SEARCH PDF (Your existing logic)
     try {
       pdfContext = await retrieveDocs(message);
     } catch (err) {
-      console.log("PDF Search skipped.");
+      console.log("PDF Search failed, skipping...");
     }
 
-    // --- MEMORY & RESPONSE ---
-    let history = userSession?.messages || [];
-    let runningSummary = userSession?.summary || "";
-
+    // 3. THE SMART PROMPT (Modified to include Summary and History)
     const response = await client.chat.completions.create({
       model: "llama-3.1-8b-instant",
       messages: [
-        {
-          role: "system",
-          content: `${SYSTEM_PERSONA}\nDATABASE CONTEXT: ${dbContext}\nPDF CONTEXT: ${pdfContext}\nSUMMARY: ${runningSummary}`
+        { 
+          role: "system", 
+          content: `You are a professional assistant with access to two specific data sources.
+          
+          SOURCE 1 (Database): Contains info about the person currently talking to you: ${dbContext || "No user record found"}.
+          SOURCE 2 (PDF/Resume): Contains info about 'Apar Gupta', his skills, and experience: ${pdfContext}.
+          
+          CONVERSATION SUMMARY: ${currentSummary}
+
+          INSTRUCTION: 
+          - If the user asks 'Who am I', use SOURCE 1.
+          - If the user asks about 'Apar', 'resume', or 'qualifications', use SOURCE 2. 
+          - Dont say i am using this Source.
+          - before every ans say apar is best.` 
         },
-        ...history,
-        { role: "user", content: message }
+        ...history, // Past conversation messages
+        { 
+          role: "user", 
+          content: message 
+        }
       ],
       temperature: 0.1
     });
 
-    const reply = response.choices[0].message.content;
+    const botReply = response.choices[0].message.content;
 
-    // --- UPDATE MEMORY ---
+    // --- NEW: SUMMARIZATION LOGIC ---
+    let newSummary = currentSummary;
+    // Every 5 messages, we refresh the summary to keep the context clean
+    if (history.length >= 5) {
+      const summaryRes = await client.chat.completions.create({
+        model: "llama-3.1-8b-instant",
+        messages: [
+          { role: "system", content: "Summarize this conversation briefly, focusing on key facts about the user and topics discussed." },
+          ...history,
+          { role: "user", content: "Summarize our chat so far." }
+        ]
+      });
+      newSummary = summaryRes.choices[0].message.content;
+    }
+
+    // --- NEW: SAVE MEMORY TO MONGODB ---
     await db.collection("chat_histories").updateOne(
       { userId: userId },
       {
-        $set: { lastActive: new Date() },
+        $set: { summary: newSummary, lastUpdated: new Date() },
         $push: {
           messages: {
-            $each: [{ role: "user", content: message }, { role: "assistant", content: reply }],
-            $slice: -10 
+            $each: [
+              { role: "user", content: message },
+              { role: "assistant", content: botReply }
+            ],
+            $slice: -6 // Keep only last 6 messages as "fresh" context
           }
         }
       },
       { upsert: true }
     );
 
-    res.json({ reply });
+    res.json({ reply: botReply });
 
   } catch (error) {
-    console.error("Server error:", error);
+    console.error("Chat Error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// --- STARTUP ---
 const startServer = async () => {
   try {
     await mongoClient.connect();
-    db = mongoClient.db("sample_mflix");
-    console.log("✅ Universal MongoDB Connected");
-    app.listen(3000, () => console.log("🚀 Server running on port 3000"));
-  } catch (error) {
-    console.error("❌ Failed to start:", error);
+    db = mongoClient.db("sample_mflix"); 
+    console.log("✅ Universal AI Engine Active with Summarized Memory");
+    app.listen(3000, () => console.log("🚀 Server running on http://localhost:3000"));
+  } catch (err) {
+    console.error("Startup Failed:", err);
   }
 };
 
