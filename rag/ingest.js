@@ -17,14 +17,14 @@ async function ingest() {
     console.log("--- Starting Ingestion ---");
     
     // 1. Load PDF
-    const pdfPath = path.join(__dirname, "../data/resume.pdf");
+    const pdfPath = path.join(__dirname, "../data/APAR_GUPTA_RESUME (8).pdf");
     const buffer = fs.readFileSync(pdfPath);
     const pdfData = await pdfParse(buffer);
     
     // 2. Split Text
     const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
     const docs = await splitter.createDocuments([pdfData.text]);
-    console.log(`✅ Created ${docs.length} chunks.`);
+    console.log(`Created ${docs.length} chunks.`);
 
     // 3. Embeddings
     const embeddings = new HuggingFaceTransformersEmbeddings({
@@ -48,9 +48,9 @@ async function ingest() {
       url: "http://localhost:8000",
     });
 
-    console.log("🚀 SUCCESS: Documents stored in ChromaDB.");
+    console.log(" SUCCESS: Documents stored in ChromaDB.");
   } catch (err) {
-    console.error("❌ Error during ingestion:", err.message);
+    console.error(" Error during ingestion:", err.message);
   }
 }
 
